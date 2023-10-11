@@ -128,10 +128,11 @@ def train():
                     break
 
                 if epsilon > 0.1:
-                    epsilon *= 0.99
-            if tot_times % 1000 == 0:
-                tmodel.set_weights(model.get_weights())
-                model_save(model, score)
+                    epsilon *= 0.999
+                if tot_times % 100 == 0:
+                    tmodel.set_weights(model.get_weights())  # update target model
+            if i % 5 == 0:
+                epsilon = 1.0  # reset epsilon
 
     except Exception as e:
         print(e)
