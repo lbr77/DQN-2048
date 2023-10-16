@@ -6,8 +6,6 @@ from gym.utils import seeding
 
 import numpy as np
 
-from PIL import Image, ImageDraw, ImageFont
-
 import itertools
 import logging
 from six import StringIO
@@ -25,23 +23,25 @@ class IllegalMove(Exception):
     pass
 
 
-def stack(flat, layers=1):
-    """Convert an [4, 4] representation into [4, 4, layers] with one layers for each value."""
-    # representation is what each layer represents
-    representation = 2 ** (np.arange(layers, dtype=int) + 1)
+def stack(flat, layers=16):
+    larray = []
+    for i in range(1, layers + 1):
+        ii = 2**i
+        layer = np.copy(flat)
+        layer[layer != ii] = 0
+        layer[layer == ii] = 1
+        # print("Layer")
+        # print(layer)
+        # print(layer.shape)
+        larray.append(layer)
 
-    # layered is the flat board repeated layers times
-    layered = np.repeat(flat[:, :, np.newaxis], layers, axis=-1)
-
-    # Now set the values in the board to 1 or zero depending whether they match representation.
-    # Representation is broadcast across a number of axes
-    layered = np.where(layered == representation, 1, 0)
-
-    return layered
+    newstack = np.stack(larray, axis=-1)
+    return newstack
 
 
-class Game2048Env(gym.Env):
-    metadata = {"render.modes": ["ansi", "human", "rgb_array"]}
+class Game2048Env(gym.Env):  # directions 0, 1, 2, 3 are up, right, down, left
+    metadata = {"render.modes": ["human", "ansi"]}
+    max_steps = 10000
 
     def __init__(self):
         # Definitions for game. Board must be square.
@@ -57,18 +57,74 @@ class Game2048Env(gym.Env):
         self.action_space = spaces.Discrete(4)
         # Suppose that the maximum tile is as if you have powers of 2 across the board.
         layers = self.squares
-        self.observation_space = spaces.Box(0, 1, (self.w, self.h, layers), dtype=int)
-        self.set_illegal_move_reward(-0.5)
+        self.observation_space = spaces.Box(
+            0, 1, (self.w, self.h, layers), dtype=np.int
+        )
+        self.set_illegal_move_reward(0.0)
         self.set_max_tile(None)
 
-        # Size of square for rendering
-        self.grid_size = 70
+        self.max_illegal = 10  # max number of illegal actions
+        self.num_illegal = 0
 
         # Initialise seed
         self.seed()
 
-        # Reset ready for a game
-        self.reset()
+        # # Reset ready for a game
+        # self.reset()
+
+    def increase_or_decrease(self):
+        reward = 0
+        for row in self.get_board():
+            I = D = True
+            for i in range(1, len(row)):
+                if row[i - 1] > row[i]:
+                    I = False
+                if row[i - 1] < row[i]:
+                    D = False
+            if I or D:
+                reward += 1
+        return reward
+
+    def corner_reward(self):
+        state = self.get_board()
+        m_tile = np.max(state)
+        return m_tile in [state[0, 0], state[0, -1], state[-1, 0], state[-1, -1]]
+
+    def calc_reward(self, score, state, state_):
+        empties = len(np.where(state == 0)[0])
+        empties_ = len(np.where(state_ == 0)[0])
+        empty_change = empties_ - empties
+        merged = empty_change
+        tile_change = np.max(state) - np.max(state_)
+        mono = self.increase_or_decrease()
+        corner = self.corner_reward()
+        score_reward = np.log2(score + 1)
+        w_merged_cells = 0.4
+        w_max_tile_chage = 0.4
+        w_score = 0.1
+        w_mono = 0.2
+        w_corner = 0.2
+        w_go_punish = 10.0
+        tot_reward = (
+            w_merged_cells * merged
+            + w_max_tile_chage * tile_change
+            + w_score * score_reward
+            + w_mono * mono
+            + w_corner * corner
+            - w_go_punish * self.isend()
+        )
+        return tot_reward
+
+    def _get_info(self, info=None):
+        if not info:
+            info = {}
+        else:
+            assert type(info) == dict, "info should be of type dict!"
+
+        info["highest"] = self.highest()
+        info["score"] = self.score
+        info["steps"] = self.steps
+        return info
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -92,8 +148,10 @@ class Game2048Env(gym.Env):
     def step(self, action):
         """Perform one step of the game. This involves moving and adding a new tile."""
         logging.debug("Action {}".format(action))
+        self.steps += 1
         score = 0
         done = None
+        state = self.get_board()
         info = {
             "illegal_move": False,
         }
@@ -104,90 +162,45 @@ class Game2048Env(gym.Env):
             self.add_tile()
             done = self.isend()
             reward = float(score)
-        except IllegalMove:
+        except IllegalMove as e:
             logging.debug("Illegal move")
             info["illegal_move"] = True
-            done = True
+            if self.steps > self.max_steps:
+                done = True
+            else:
+                done = False
             reward = self.illegal_move_reward
+            self.num_illegal += 1
+            if (
+                self.num_illegal >= self.max_illegal
+            ):  # exceed the maximum number of illegal actions
+                done = True
 
-        # print("Am I done? {}".format(done))
-        info["highest"] = self.highest()
-
+        info = self._get_info(info)
+        state_ = self.get_board()
+        reward = self.calc_reward(reward, state, state_)
         # Return observation (board state), reward, done and info dict
-        # return stack(self.Matrix), reward, done, info
-        return stack(self.Matrix), reward, done, info
+        return self.Matrix, reward, done, info
 
     def reset(self):
-        self.Matrix = np.zeros((self.h, self.w), int)
+        self.Matrix = np.zeros((self.h, self.w), np.int)
         self.score = 0
+        self.steps = 0
+        self.num_illegal = 0
 
         logging.debug("Adding tiles")
         self.add_tile()
         self.add_tile()
 
-        return stack(self.Matrix)
+        return self.Matrix, 0, False, self._get_info()
 
     def render(self, mode="human"):
-        if mode == "rgb_array":
-            black = (0, 0, 0)
-            grey = (128, 128, 128)
-            white = (255, 255, 255)
-            tile_colour_map = {
-                2: (255, 0, 0),
-                4: (224, 32, 0),
-                8: (192, 64, 0),
-                16: (160, 96, 0),
-                32: (128, 128, 0),
-                64: (96, 160, 0),
-                128: (64, 192, 0),
-                256: (32, 224, 0),
-                512: (0, 255, 0),
-                1024: (0, 224, 32),
-                2048: (0, 192, 64),
-                4096: (0, 160, 96),
-            }
-            grid_size = self.grid_size
-
-            # Render with Pillow
-            pil_board = Image.new("RGB", (grid_size * 4, grid_size * 4))
-            draw = ImageDraw.Draw(pil_board)
-            draw.rectangle([0, 0, 4 * grid_size, 4 * grid_size], grey)
-            fnt = ImageFont.truetype("Arial.ttf", 30)
-
-            for y in range(4):
-                for x in range(4):
-                    o = self.get(y, x)
-                    if o:
-                        draw.rectangle(
-                            [
-                                x * grid_size,
-                                y * grid_size,
-                                (x + 1) * grid_size,
-                                (y + 1) * grid_size,
-                            ],
-                            tile_colour_map[o],
-                        )
-                        (text_x_size, text_y_size) = draw.textsize(str(o), font=fnt)
-                        draw.text(
-                            (
-                                x * grid_size + (grid_size - text_x_size) // 2,
-                                y * grid_size + (grid_size - text_y_size) // 2,
-                            ),
-                            str(o),
-                            font=fnt,
-                            fill=white,
-                        )
-                        assert text_x_size < grid_size
-                        assert text_y_size < grid_size
-
-            return np.asarray(pil_board).swapaxes(0, 1)
-
         outfile = StringIO() if mode == "ansi" else sys.stdout
         s = "Score: {}\n".format(self.score)
         s += "Highest: {}\n".format(self.highest())
         npa = np.array(self.Matrix)
         grid = npa.reshape((self.size, self.size))
-        s += "{}\n".format(grid)
+        s += "{}\n\n".format(grid)
         outfile.write(s)
         return outfile
 
@@ -271,8 +284,6 @@ class Game2048Env(gym.Env):
         if changed != True:
             raise IllegalMove
 
-        if move_score == 0:
-            return -0.5
         return move_score
 
     def combine(self, shifted_row):
@@ -326,6 +337,9 @@ class Game2048Env(gym.Env):
         must be legal moves."""
 
         if self.max_tile is not None and self.highest() == self.max_tile:
+            return True
+
+        if self.steps >= self.max_steps:
             return True
 
         for direction in range(4):
